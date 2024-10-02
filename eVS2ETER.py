@@ -50,44 +50,36 @@ mapping = {
     },
 }
 
-add_blank = {
-    'SPOL': [
-		'GENUNCL',
-        'GEN_FLAG',
-		'NAT',
-		'FOR',
-		'CITUNCL',
-        'CITIZ_FLAG',
-    ],
-    'REZIDENT': [
-		'MOBUNCL',
-        'MOB_FLAG',
-		'FOE00',
-    ],
-    'KLS_P16_OPIS_ANGL_1R': [
-		'FOEUNCL',
-        'FOE_FLAG',
-    ],
-    'NACIN_STUDIJA': [
-		'PARTFULLUNCL',
-        'PARTFULL_FLAG',
-    ],
-    'STAROST_OBMOCJA': [
-		'AGEUNCL',
-        'AGE_FLAG',
-    ],
-    'TOTAL': [
-        'TOTAL_FLAG',
-        'NOTES',
-    ],
+flag_suffix = {
+    'SPOL': 'GEN',
+    'REZIDENT': 'MOB',
+    'KLS_P16_OPIS_ANGL_1R': 'FOE',
+    'NACIN_STUDIJA': 'PARTFULL',
+    'STAROST_OBMOCJA': 'AGE',
 }
 
 map_levels = {
     'ISCED6': 6,
     'ISCED7': "7 - master",
-    'ISCED7LON': "7 - long degree",
+    'ISCED7LONG': "7 - long degree",
     'ISCED8': 8,
 }
+
+prefix = {
+    'STUD': {
+        'ISCED6': 'STUD{sep}',
+        'ISCED7': 'STUD{sep}',
+        'ISCED7LONG': 'STUD{sep}',
+        'ISCED8': 'RES{sep}STUD',
+    },
+    'GRAD': {
+        'ISCED6': 'GRAD{sep}',
+        'ISCED7': 'GRAD{sep}',
+        'ISCED7LONG': 'GRAD{sep}',
+        'ISCED8': 'RES{sep}GRAD',
+    },
+}
+
 
 eVS_kwargs = {
     'dtype': {
@@ -119,19 +111,39 @@ orgreg_kwargs = {
     'index_col': 'NID',
 }
 
+anonymisation_threshold = 5
+
 def f_year_level(df, year, level):
     """
     select rows for relevant academic year and ISCED level
     """
     return df[(df.STUDIJSKO_LETO == year) & (df.ISCED_VREDNOST == map_levels.get(level))]
 
-def do_breakdown(df, char):
+def anonymise_row(row, flags):
+    """
+    anonymise values in a row if below threshold
+    """
+    if (row[row.index != flags] <= anonymisation_threshold).any():
+        anon = row.map(lambda n: 'm')
+        anon[flags] = 'c'
+        return anon
+    else:
+        return row
+
+def do_breakdown(df, year, category, level, char):
     """
     do breakdown by specific characteristic
     """
-    return df.groupby(['SIFRA_ZAVODA', char], observed=False)['ST'].sum().unstack().rename(columns=mapping.get(char))
+    prefix_data = prefix[category][level].format(sep='.')
+    flag_column = prefix[category][level].format(sep='.FLAG') + level + flag_suffix[char]
+    breakdown = df.groupby(['SIFRA_ZAVODA', char], observed=False)['ST'] \
+        .sum() \
+        .unstack() \
+        .rename(columns={ k: f'{prefix_data}{level}{v}' for k, v in mapping.get(char).items() })
+    breakdown[flag_column] = ''
+    return breakdown.transform(anonymise_row, axis='columns', flags=flag_column)
 
-def do_year(df, year):
+def do_year(df, year, category):
     """
     combine breakdowns by levels and otehr characteristics
     """
@@ -140,16 +152,14 @@ def do_year(df, year):
         selection = df.pipe(f_year_level, year, level)
         for char in mapping.keys():
             if char in df.columns:
-                this_df = selection.pipe(do_breakdown, char).rename(columns=lambda n: f'STUD.{level}{n}')
-                for blank in add_blank[char]:
-                    this_df[f'STUD.{level}{blank}'] = pd.NA
-                frames.append(this_df)
-        total = pd.DataFrame({
-            f'STUD.{level}TOTAL': selection.groupby(['SIFRA_ZAVODA'], observed=False)['ST'].sum(),
+                frames.append(selection.pipe(do_breakdown, year, category, level, char))
+        total_data = prefix[category][level].format(sep='.') + level + 'TOTAL'
+        total_flag = prefix[category][level].format(sep='.FLAG') + level + 'TOTAL'
+        totals = pd.DataFrame({
+            total_data: selection.groupby(['SIFRA_ZAVODA'], observed=False)['ST'].sum(),
+            total_flag: ''
         })
-        for blank in add_blank['TOTAL']:
-            total[f'STUD.{level}{blank}'] = pd.NA
-        frames.append(total)
+        frames.append(totals.transform(anonymise_row, axis='columns', flags=total_flag))
     return pd.concat(frames, axis=1)
 
 if __name__ == '__main__':
@@ -158,6 +168,7 @@ if __name__ == '__main__':
     parser.add_argument("YEAR", help="academic year(s)", type=int, nargs='+')
     parser.add_argument("-d", "--destination", help="output directory for generated files", default='.')
     parser.add_argument("-o", "--orgreg", help="files with OrgReg reference data", default='orgreg.ods')
+    parser.add_argument("-c", "--category", help="students or graduates", type=str.upper, default='STUD', choices=['STUD','GRAD'])
     args = parser.parse_args()
 
     if not (os.path.isdir(args.destination) and os.access(args.destination, os.W_OK)):
@@ -167,14 +178,11 @@ if __name__ == '__main__':
     eVS = pd.read_excel(args.SRC, **eVS_kwargs)
 
     logger.info(f"Loading OrgReg reference data from {args.orgreg}")
-    orgreg = pd.read_excel('orgreg.ods', **orgreg_kwargs)
+    orgreg = pd.read_excel(args.orgreg, **orgreg_kwargs)
 
     for year in args.YEAR:
         logger.info(f"Exporting tables for {year}")
-        eVS.pipe(do_year, year).join(orgreg).sort_values('ETER_ID').to_excel(os.path.join(args.destination, f'ETER_{os.path.splitext(os.path.basename(args.SRC))[0]}_{year}.ods'))
-
-# TO DO for future ref:
-#
-# - fill cells with 0
-#
+        this = eVS.pipe(do_year, year, args.category).fillna(0).join(orgreg).sort_values('ETER_ID') #.map(lambda x: int() if pd.isna(x) else x)
+        this['BAS.ETERIDYEAR'] = this['ETER_ID'] + f'.{year}'
+        this.set_index('BAS.ETERIDYEAR').to_excel(os.path.join(args.destination, f'ETER_{os.path.splitext(os.path.basename(args.SRC))[0]}_{year}.ods'), sheet_name='additional-data')
 
